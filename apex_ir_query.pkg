@@ -1,0 +1,395 @@
+CREATE OR REPLACE PACKAGE apex_ir_query IS
+
+  -- Author  : STEWART_L_STRYKER
+  -- Created : 2/13/2009 4:00:45 PM
+  -- Purpose : Method of collecting user query from Interactive Report
+
+  -- GRANT EXECUTE ON apex_ir_query to <apex_schema>;
+
+  /* ----------- PUBLIC FUNCTION AND PROCEDURE DECLARATIONS ----------- */
+
+    /* Setup:
+
+       Add your own version of the following Javascript function to the application page
+       that contains the button to run your custom report.
+       In this example, I'm popping up a new page (#7) to display a PDF report.  The important
+       thing is to pass the apexir_report_id value to a page item via a parameter.
+
+        <script language="JavaScript" type="text/javascript">
+        function SaveAndRunReport() {
+             popUp2('f?p=&APP_ID.:7:&SESSION.:new_request:NO::'+
+                    'P7_IR_REPORT_ID:'+$v('apexir_report_id'), 1024, 768);
+        }
+</script>
+
+        I calculate this WHERE clause, then add it to a fixed query string that our interactive
+        reports run against.
+
+        It supports Filters, Searches and Saved reports.
+        It DOES NOT support saving the Sort order.
+
+    */
+    -- Generate IR query string
+    FUNCTION ir_query_where(app_id_in IN NUMBER,
+                            page_id_in IN NUMBER,
+                            session_id_in IN NUMBER,
+                            base_report_id_in IN VARCHAR2) RETURN VARCHAR2;
+
+END apex_ir_query;
+/
+CREATE OR REPLACE PACKAGE BODY apex_ir_query IS
+
+  /* ----------- PRIVATE FUNCTION AND PROCEDURE DECLARATIONS ----------- */
+    FUNCTION string_is_valid_date(string_in IN VARCHAR2, format_in IN VARCHAR2 DEFAULT 'MM/DD/YYYY')
+        RETURN BOOLEAN IS
+        v_date DATE;
+    -- From Kai-Joachim Kamrath @ columbia.edu
+    BEGIN
+        IF string_in IS NULL
+        THEN
+            RETURN FALSE;
+        ELSE
+            v_date := to_date(string_in, format_in);
+            RETURN TRUE;
+        END IF;
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN FALSE;
+    END string_is_valid_date;
+
+   FUNCTION string_is_valid_number (string_in IN VARCHAR2)
+      RETURN BOOLEAN
+   IS
+      l_dummy       NUMBER;
+      l_is_number   BOOLEAN DEFAULT FALSE;
+   BEGIN
+      IF string_in IS NOT NULL
+      THEN
+         l_dummy := TO_NUMBER (string_in);
+         l_is_number := TRUE;
+      END IF;
+
+      RETURN l_is_number;
+   EXCEPTION
+      WHEN OTHERS
+      THEN
+         RETURN FALSE;
+   END string_is_valid_number;
+
+    -- Generic routine to log usage to your favorite log table
+    -- You'll need to write your own version, as this is simply a place-holder for the
+    -- installation-specific version I call in production
+    PROCEDURE log_apex_access(app_name_in IN VARCHAR2, 
+                              app_user_in IN VARCHAR2, 
+                              msg_in IN VARCHAR2) IS
+    BEGIN
+        NULL;
+    END log_apex_access;
+  
+    -- Convert Apex Interactive Report filter values to query clause
+    FUNCTION ir_query_parse_filter(col_name IN VARCHAR2,
+                            col_operator IN VARCHAR2,
+                            exp1 IN VARCHAR2,
+                            exp2 IN VARCHAR2) RETURN VARCHAR2 IS
+        result_clause VARCHAR2(512);
+        l_col_name VARCHAR2(32) := TRIM(col_name);
+        l_col_operator VARCHAR2(32) := LOWER(TRIM(col_operator));
+        l_expr1 VARCHAR2(512) := REPLACE(TRIM(exp1), '''', '''''');
+        l_expr2 VARCHAR2(512) := REPLACE(TRIM(exp2), '''', '''''');
+        in_list VARCHAR2(512);
+        in_table wwv_flow_global.vc_arr2;
+    
+        FUNCTION wrap_expr(expr_in IN VARCHAR2) RETURN VARCHAR2 IS
+            c_date_fmt CONSTANT VARCHAR2(32) := 'YYYYMMDD';
+            l_expr VARCHAR2(512) := TRIM(expr_in);
+            l_short_date VARCHAR2(8) := SUBSTR(l_expr, 1, 8);
+        BEGIN
+            IF string_is_valid_date(l_short_date, c_date_fmt)
+            THEN
+                RETURN 'TO_DATE(''' || l_short_date || ''', ''' || c_date_fmt || ''')';
+            ELSIF string_is_valid_number(l_expr)
+            THEN
+                RETURN l_expr;
+            ELSE
+                RETURN '''' || l_expr || '''';
+            END IF;
+        END wrap_expr;
+    
+        -- For "in the last/next" date comparisons
+        FUNCTION calc_time_diff(operator_in IN VARCHAR2,
+                                value_in IN VARCHAR2,
+                                diff_expr IN VARCHAR2) RETURN VARCHAR2 IS
+            ret_value VARCHAR2(60);
+            factor VARCHAR2(32);
+        BEGIN
+            factor := CASE LOWER(diff_expr) 
+                          WHEN 'minutes' THEN value_in || ' / 1440' 
+                          WHEN 'hours' THEN value_in || ' / 24' 
+                          WHEN 'days' THEN value_in 
+                          WHEN 'weeks' THEN value_in || ' * 7' 
+                          WHEN 'months' THEN value_in || ' * 30' 
+                          WHEN 'years' THEN value_in || ' * 365' 
+                          END;
+            ret_value := CASE operator_in 
+                         WHEN 'is in the last' THEN '>= SYSDATE - (' || factor || ')' 
+                         WHEN 'is in the next' THEN '>= SYSDATE + (' || factor || ')' 
+                         WHEN 'is not in the last' 
+                              THEN 'NOT BETWEEN (SYSDATE - ' || factor || ') AND SYSDATE' 
+                         WHEN 'is not in the next' 
+                              THEN 'NOT BETWEEN SYSDATE AND (SYSDATE + ' || factor || ')' 
+                         END;
+            RETURN ret_value;
+        END calc_time_diff;
+    
+    BEGIN
+        CASE
+            WHEN l_col_operator IN ('not in', 'in') THEN
+                in_table := apex_util.string_to_table(l_expr1, ',');
+            
+                IF in_table.COUNT > 0
+                THEN
+                    FOR i IN 1 .. in_table.COUNT
+                    LOOP
+                        in_table(i) := TRIM(in_table(i));
+                    
+                        in_table(i) := wrap_expr(in_table(i));
+                    END LOOP;
+                END IF;
+                in_list := apex_util.table_to_string(in_table, ',');
+                result_clause := l_col_name || ' ' || l_col_operator || ' (' || in_list || ')';
+            WHEN l_col_operator IN ('is null', 'is not null') THEN
+                result_clause := l_col_name || ' ' || l_col_operator;
+            WHEN l_col_operator IN ('not like',
+                                           'like',
+                                           '=',
+                                           '>=',
+                                           '<=',
+                                           '<',
+                                           '>',
+                                           '!=') THEN
+                result_clause := l_col_name || ' ' || l_col_operator || ' ' || wrap_expr(l_expr1);
+            WHEN l_col_operator IN ('regexp_like') THEN
+                result_clause := l_col_operator || '(' || l_col_name || ', ' || wrap_expr(l_expr1) || ')';
+            WHEN l_col_operator = 'contains' THEN
+                result_clause := 'INSTR(UPPER(' || l_col_name || '), UPPER(''' || l_expr1 || ''')) > 0';
+            WHEN l_col_operator = 'does not contain' THEN
+                result_clause := 'INSTR(UPPER(' || l_col_name || '), UPPER(''' || l_expr1 || ''')) = 0';
+            WHEN l_col_operator = 'between' THEN
+                result_clause := l_col_name || ' ' || l_col_operator || ' ' || wrap_expr(l_expr1) ||
+                                 ' AND ' || wrap_expr(l_expr2);
+            WHEN l_col_operator LIKE 'is %in the %' THEN
+                result_clause := l_col_name || ' ' ||
+                                 calc_time_diff(l_col_operator, l_expr1, l_expr2);
+            ELSE
+                DBMS_OUTPUT.PUT_LINE('Unknown operator: ' || l_col_operator || ']');
+        END CASE;
+    
+        RETURN result_clause;
+    END ir_query_parse_filter;
+
+    -- Convert Apex Interactive Report filter values to query clause
+    FUNCTION ir_query_parse_search(col_name_list IN VARCHAR2, 
+                             expr_in IN VARCHAR2,
+                             app_id_in IN NUMBER,
+                             ir_id_in IN VARCHAR2 DEFAULT NULL) RETURN VARCHAR2 IS
+        crlf CONSTANT VARCHAR2(2) := CHR(10);
+    
+        result_clause VARCHAR2(2000);
+        l_expr VARCHAR2(512);
+        col_name_table wwv_flow_global.vc_arr2;
+        col_count PLS_INTEGER := 0;
+        match_count PLS_INTEGER := 0;
+    
+        FUNCTION wrap_expr(exp_in IN VARCHAR2) RETURN VARCHAR2 IS
+            l_expr VARCHAR2(512) := TRIM(exp_in);
+        BEGIN
+            RETURN '''' || l_expr || '''';
+        END wrap_expr;
+        
+        -- limit searches to String and numbers and exclude bogus columns
+        -- which can be generated by Apex
+        FUNCTION right_col_type(col_name_in IN VARCHAR2) RETURN BOOLEAN IS
+            found_col VARCHAR2(32);
+        BEGIN
+            SELECT col.column_type
+              INTO found_col
+              FROM apex_application_page_ir_col col
+             WHERE col.application_id = app_id_in
+           --    AND col.page_id = page_id_in
+               AND col.interactive_report_id = ir_id_in
+               AND col.allow_filtering = 'Yes'
+               AND col.column_type IN ('STRING', 'NUMBER')
+               AND col.column_alias = col_name_in
+               AND rownum <= 1;
+               
+           RETURN found_col IS NOT NULL;
+        
+        EXCEPTION WHEN OTHERS THEN
+            RETURN FALSE;
+        END;
+                             
+    BEGIN
+        -- Simplistic protection against user entering huge match value
+        IF length(REPLACE(TRIM(expr_in), '''', '''''')) > 512
+        THEN
+            RETURN NULL;
+        END IF;
+        
+        l_expr := REPLACE(TRIM(expr_in), '''', '''''');
+        col_name_table := apex_util.string_to_table(col_name_list);
+        col_count := col_name_table.COUNT;
+
+        IF col_count > 0
+           AND l_expr IS NOT NULL
+        THEN
+            result_clause := '(';
+            
+            FOR i IN 1 .. col_count
+            LOOP
+                IF result_clause > '(' AND right_col_type(col_name_table(i))
+                THEN
+                    result_clause := result_clause || ' or ';
+                END IF;
+
+                IF right_col_type(col_name_table(i))
+                THEN            
+                    match_count := match_count + 1;
+                    result_clause := result_clause || 'instr(upper(' || col_name_table(i) ||
+                                     '), upper(' || wrap_expr(l_expr) || ')) > 0' || crlf;
+                END IF;
+            END LOOP;
+        END IF;
+    
+        result_clause := result_clause || ')';
+        RETURN result_clause;
+    EXCEPTION
+    WHEN OTHERS THEN
+            log_apex_access(app_name_in => 'ir_query_parse_search',
+                                              app_user_in => v('APP_USER'),
+                                              msg_in      => 'EXCEPTION: ' || SQLERRM ||
+                                                             '.  column count: ' || col_count ||
+                                                             '.  IR Report id: ' || ir_id_in ||
+                                                             '.  l_expr length: ' || LENGTH(l_expr));
+    END ir_query_parse_search;
+
+    -- Generate IR query string for a user from their filters and searches
+    FUNCTION ir_query_where(app_id_in IN NUMBER,
+                            page_id_in IN NUMBER,
+                            session_id_in IN NUMBER,
+                            base_report_id_in IN VARCHAR2) RETURN VARCHAR2 IS
+        /* 
+            Parameters:     base_report_id_in - User's currently-displayed report (including saved)
+        
+            Returns:        ANDed WHERE clause to be run against base view
+        
+            Author:         STEWART_L_STRYKER
+            Created:        2/12/2009 5:16:51 PM
+        
+            Usage:          RETURN apex_ir_query.ir_query_where(app_id_in => :APP_ID, 
+                                        page_id_in => 2, 
+                                        session_id_in => :APP_SESSION);
+        
+            CS-RCS Modification History: (Do NOT edit manually)
+        
+            $Log: $
+        */
+        query_string VARCHAR2(32500);
+        test_val VARCHAR2(80);
+        search_count PLS_INTEGER := 0;
+        clause VARCHAR2(32000);
+        
+        query_too_long EXCEPTION;
+        PRAGMA EXCEPTION_INIT(query_too_long, -24381);
+    BEGIN
+        FOR filters IN (SELECT condition_column_name,
+                               condition_operator,
+                               condition_expression,
+                               condition_expression2
+                          FROM apex_application_page_ir_cond cond
+                          JOIN apex_application_page_ir_rpt r ON r.application_id =
+                                                                 cond.application_id
+                                                             AND r.page_id = cond.page_id
+                                                             AND r.report_id = cond.report_id
+                         WHERE cond.application_id = app_id_in
+                           AND cond.page_id = page_id_in
+                           AND cond.condition_type = 'Filter'
+                           AND cond.condition_enabled = 'Yes'
+                           AND r.base_report_id = base_report_id_in
+                           AND r.session_id = session_id_in)
+        LOOP
+            clause := ir_query_parse_filter(filters.condition_column_name,
+                                            filters.condition_operator,
+                                            filters.condition_expression,
+                                            filters.condition_expression2);
+            IF LENGTH(clause) + LENGTH(query_string) > 32500
+            THEN
+                RAISE query_too_long;
+            END IF;
+            
+            query_string := query_string || ' AND ' || clause;                            
+        END LOOP;
+    
+
+        FOR searches IN (SELECT r.report_columns,
+                                cond.condition_expression,
+                                to_char(r.interactive_report_id) AS interactive_report_id
+                          FROM apex_application_page_ir_cond cond
+                          JOIN apex_application_page_ir_rpt r ON r.application_id =
+                                                                 cond.application_id
+                                                             AND r.page_id = cond.page_id
+                                                             AND r.report_id = cond.report_id
+                         WHERE cond.application_id = app_id_in
+                           AND cond.page_id = page_id_in
+                           AND cond.condition_type = 'Search'
+                           AND cond.condition_enabled = 'Yes'
+                           AND r.base_report_id = base_report_id_in
+                           AND r.session_id = session_id_in)
+        LOOP
+            search_count := search_count + 1;
+            test_val := NVL(searches.interactive_report_id, 'null');
+            clause := ir_query_parse_search(searches.report_columns,
+                                            searches.condition_expression,
+                                            app_id_in,
+                                            searches.interactive_report_id);
+
+            IF LENGTH(clause) + LENGTH(query_string) > 32500
+            THEN
+                RAISE query_too_long;
+            END IF;
+            
+            query_string := query_string || ' AND ' || clause;
+                            
+        END LOOP;
+
+        log_apex_access(app_name_in => app_id_in,
+                                          app_user_in => v('APP_USER'),
+                                          msg_in      => 'Searches: ' || search_count ||
+                                                         '.  base_report_id_in: ' || nvl(base_report_id_in, 'null')
+                                                         || '.  Session: ' || session_id_in);
+        RETURN query_string;
+    EXCEPTION
+        WHEN query_too_long THEN
+            log_apex_access(app_name_in => app_id_in,
+                                              app_user_in => v('APP_USER'),
+                                              msg_in      => 'Generated query string would have been > 32k');
+        
+            RETURN query_string;
+        WHEN no_data_found THEN
+            log_apex_access(app_name_in => app_id_in,
+                                              app_user_in => v('APP_USER'),
+                                              msg_in      => 'NDF. Searches: ' || search_count ||
+                                                             '.  IR Report id: ' || nvl(test_val, 'null'));
+        
+            RETURN query_string;
+        WHEN OTHERS THEN
+            log_apex_access(app_name_in => app_id_in,
+                                              app_user_in => v('APP_USER'),
+                                              msg_in      => 'EXCEPTION: ' || SQLERRM ||
+                                                             '.  Searches: ' || search_count ||
+                                                             '.  IR Report id: ' || nvl(test_val, 'null'));
+        
+            RETURN query_string;
+    END ir_query_where;
+
+END apex_ir_query;
+/
