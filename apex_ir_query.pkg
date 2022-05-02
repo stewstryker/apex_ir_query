@@ -132,7 +132,7 @@ CREATE OR REPLACE PACKAGE BODY apex_ir_query IS
                           END;
             ret_value := CASE operator_in 
                          WHEN 'is in the last' THEN '>= SYSDATE - (' || factor || ')' 
-                         WHEN 'is in the next' THEN '>= SYSDATE + (' || factor || ')' 
+                         WHEN 'is in the next' THEN '<= SYSDATE + (' || factor || ')' 
                          WHEN 'is not in the last' 
                               THEN 'NOT BETWEEN (SYSDATE - ' || factor || ') AND SYSDATE' 
                          WHEN 'is not in the next' 
